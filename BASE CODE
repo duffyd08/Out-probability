@@ -1,0 +1,156 @@
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(baseballr)
+
+directory <- "C:/Users/Drew Duffy/OneDrive/out_prob_23/"
+
+# could not pull all data from statcast at once so created directory to combine all
+csv_files <- list.files(directory, pattern = "\\.csv$", full.names = TRUE)
+
+# Read and combine all CSV files
+out_prob_23 <- lapply(csv_files, read_csv) %>% bind_rows()
+
+# defining what out states we are looking into
+out_outcomes <- c("field_out", "force_out", "sac_bunt", "fielders_choice_out", "other_out", 
+                  "grounded_into_double_play", "sac_fly", "double_play", "sac_fly_double_play")
+
+# cleaning and adding columns to our data
+out_prob_1 <- out_prob_23 %>% 
+  mutate(location = as.factor(hit_location), 
+         pitch_type = as.factor(pitch_type), 
+         infield_align = as.factor(if_fielding_alignment), 
+         of_align = as.factor(of_fielding_alignment), 
+         description = as.factor(description),
+         pitcher_ID = as.factor(pitcher...8), 
+         catcher_ID = as.factor(fielder_2...42), 
+         wpa = (delta_home_win_exp),
+         out_hit = ifelse(events %in% out_outcomes, 1, 0), 
+         home_team = as.factor(home_team),
+         away_team = as.factor(away_team)
+         ) %>%
+  select(launch_speed, launch_angle, estimated_woba_using_speedangle,
+         location, bat_speed, swing_length, release_speed, pitch_type, description, outs_when_up ,
+         hit_distance_sc, inning_topbot, infield_align, of_align, events, out_hit, pitcher_ID,
+         catcher_ID, fielder_3, fielder_4, fielder_5, fielder_6, fielder_7, home_team, away_team , 
+         fielder_8, fielder_9, game_date, bb_type, wpa)%>% 
+  filter(description == "hit_into_play")
+
+# creating a defensive win probability change. 
+out_prob_1$def_win_probability_change <- ifelse(
+  out_prob_1$inning_topbot == "Top", 
+  out_prob_1$wpa,  # Top of the inning, the road team benefits from the negative home win probability change
+  -out_prob_1$wpa  # Bottom of the inning, the home team benefits directly from the change (vice versa)
+)
+
+#creating path to pull which team is on defense (to be used later)
+out_prob_1 <- out_prob_1 %>%
+  mutate(defteam = case_when(
+    inning_topbot == "Top" ~ home_team, 
+    inning_topbot == "Bot" ~ away_team 
+  ))
+
+# mapping where the hit location is so that the respective fielder will be pulled for later data use
+fielder_mapping <- function(location) {
+  case_when(
+    location == 1 ~ "fielder_1", 
+    location == 2 ~ "fielder_2",
+    location == 3 ~ "fielder_3",
+    location == 4 ~ "fielder_4",
+    location == 5 ~ "fielder_5",
+    location == 6 ~ "fielder_6",
+    location == 7 ~ "fielder_7",
+    location == 8 ~ "fielder_8",
+    location == 9 ~ "fielder_9",
+    TRUE ~ "unknown_fielder"
+  )
+}
+
+# applying these to fielder column
+out_prob_1 <- out_prob_1 %>%
+  mutate(fielder = sapply(location, fielder_mapping))
+
+#this line will take a little longer to execute, had to convert all to character to execute
+out_prob_1 <- out_prob_1 %>%
+  mutate(across(c(pitcher_ID, catcher_ID, fielder_3, fielder_4, 
+                  fielder_5, fielder_6, fielder_7, fielder_8, fielder_9), as.character))
+
+# the value of each fielder will now populate in the key_mlbam column
+out_prob_1 <- out_prob_1 %>%
+  mutate(key_mlbam = case_when(
+    location == 1 ~ pitcher_ID, 
+    location == 2 ~ catcher_ID , 
+    location == 3  ~ fielder_3, 
+    location == 4  ~ fielder_4, 
+    location == 5  ~ fielder_5,
+    location == 6 ~ fielder_6,
+    location == 7 ~ fielder_7,
+    location == 8 ~ fielder_8, 
+    location == 9 ~ fielder_9,
+    TRUE ~ NA_character_
+  ))
+
+# creating a vector for the player registry
+player_name <- chadwick_player_lu()
+
+# selecting relevant columns in this data
+player_name1 <- player_name %>%
+  select(key_mlbam, name_last, name_first) %>% 
+  mutate(key_mlbam = as.factor(key_mlbam)) %>% 
+  filter(!is.na(key_mlbam))
+
+# joining the list of names with the key_mlbam to get player names in the new data
+list_with_names <- left_join(out_prob_1, player_name1, by = "key_mlbam")
+
+# narrowing down our data again
+final_out_prob <- list_with_names %>% 
+  select(launch_speed, launch_angle, estimated_woba_using_speedangle,
+         location, bat_speed, swing_length, release_speed, pitch_type, description,
+         hit_distance_sc, infield_align, of_align, events, out_hit, game_date, outs_when_up,
+         key_mlbam, name_last, name_first, wpa, location, def_win_probability_change, defteam, pitcher_ID)
+final_out_prob$name_full <- paste(list_with_names$name_first, list_with_names$name_last)
+
+# after trying different models and looking at multicolinearity, these two factors will be the basis for our out model
+out_model_location_woba <- glm(out_hit ~ location + estimated_woba_using_speedangle,
+                               data = final_out_prob,
+                               family = binomial())
+# creating a percentage chance for an out to occur
+final_out_prob$predicted_out_pct_location_woba <- predict(out_model_location_woba,
+                                                          newdata = final_out_prob,
+                                                          type = "response")
+
+# decided that .60 would be a limit that we would hope to see fielders convert outs
+limit <- 0.60
+
+# Convert predicted probabilities to binary outcomes so that predicted out will return a 1 if it is > .6
+final_out_prob$predicted_out <- ifelse(final_out_prob$predicted_out_pct_location_woba > limit, 1, 0)
+
+# cleaning data once again for visualizations
+for_viz <- final_out_prob %>% 
+  select(name_full, predicted_out_pct_location_woba, def_win_probability_change, game_date, out_hit,
+         predicted_out, estimated_woba_using_speedangle, events, location, defteam, outs_when_up)
+
+
+# looking at different out conversions and creating an outs over expected metric
+final_clean_total <- for_viz %>% 
+  mutate(out_o_exp = case_when(
+    out_hit == 1 & predicted_out == 0 ~ 1,
+    out_hit == 0 & predicted_out == 1 ~ -1, 
+    TRUE ~ 0 )) %>% 
+  filter(!is.na(location))
+  group_by(name_full, defteam, location) %>% 
+  select(name_full, out_o_exp, location, predicted_out_pct_location_woba, def_win_probability_change, events) %>% 
+  summarize(def_wpa = sum(def_win_probability_change), 
+            sum_ooe = sum(out_o_exp)) 
+
+# for personal research, looking at the differences that exist on plays that were deemed errors
+final_clean_error <-  for_viz %>%
+  mutate(out_o_exp = case_when(
+    out_hit == 1 & predicted_out == 0 ~ 1,
+    out_hit == 0 & predicted_out == 1 ~ -1, 
+    TRUE ~ 0 )) %>% 
+  group_by(defteam, location) %>% 
+  filter(events == "field_error") %>% 
+  select(name_full, out_o_exp, location, predicted_out_pct_location_woba, def_win_probability_change, events) %>% 
+  summarize(def_wpa = sum(def_win_probability_change), 
+            sum_ooe = sum(out_o_exp)) 
